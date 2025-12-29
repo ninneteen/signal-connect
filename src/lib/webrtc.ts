@@ -2,6 +2,7 @@ export interface PeerConnection {
   id: string;
   connection: RTCPeerConnection;
   audioStream?: MediaStream;
+  audioSender?: RTCRtpSender;
   isPolite: boolean; // For perfect negotiation pattern
   makingOffer: boolean;
   pendingCandidates: RTCIceCandidateInit[];
@@ -95,7 +96,7 @@ export class WebRTCManager {
       this.isMicEnabled = false;
 
       // Add tracks to all existing peer connections
-      this.addTracksToAllPeers();
+      await this.addTracksToAllPeers();
 
       console.log('Local stream initialized with enhanced noise cancellation, mic OFF');
       return this.processedStream;
@@ -153,41 +154,43 @@ export class WebRTCManager {
     }
   }
 
-  private addTracksToAllPeers() {
+  private async addTracksToAllPeers() {
     const streamToUse = this.processedStream || this.localStream;
     if (!streamToUse) return;
 
     console.log('Adding tracks to all existing peers:', this.peers.size);
 
-    this.peers.forEach((peer, peerId) => {
-      const senders = peer.connection.getSenders();
-      const hasAudioSender = senders.some(s => s.track?.kind === 'audio');
-
-      if (!hasAudioSender) {
-        console.log('Adding audio track to peer:', peerId);
-        streamToUse.getTracks().forEach((track) => {
-          peer.connection.addTrack(track, streamToUse);
-        });
-
-        // Renegotiate connection
-        this.renegotiate(peerId, peer.connection);
-      }
-    });
+    for (const [peerId, peer] of this.peers) {
+      await this.attachLocalAudio(peerId, peer.connection);
+      await this.renegotiate(peerId, peer.connection);
+    }
   }
 
   private async renegotiate(peerId: string, peerConnection: RTCPeerConnection) {
+    const peer = this.peers.get(peerId);
+    if (!peer) return;
+
+    // Only renegotiate when we have an established negotiation and are stable
+    if (!peerConnection.remoteDescription) return;
+    if (peer.makingOffer) return;
+    if (peerConnection.signalingState !== 'stable') return;
+
     try {
+      peer.makingOffer = true;
       console.log('Renegotiating with peer:', peerId);
+
       const offer = await peerConnection.createOffer();
       await peerConnection.setLocalDescription(offer);
 
       this.sendToSignalingServer({
         type: 'offer',
         to: peerId,
-        sdp: offer,
+        sdp: peerConnection.localDescription,
       });
     } catch (error) {
       console.error('Renegotiation failed:', error);
+    } finally {
+      peer.makingOffer = false;
     }
   }
 
@@ -307,25 +310,41 @@ export class WebRTCManager {
     }
   }
 
+  private async attachLocalAudio(peerId: string, peerConnection: RTCPeerConnection) {
+    const peer = this.peers.get(peerId);
+    const streamToUse = this.processedStream || this.localStream;
+    const track = streamToUse?.getAudioTracks?.()[0];
+
+    if (!peer || !streamToUse || !track) return;
+
+    try {
+      if (peer.audioSender) {
+        if (peer.audioSender.track?.id === track.id) return;
+        await peer.audioSender.replaceTrack(track);
+        return;
+      }
+
+      // Fallback (should not happen): addTrack creates a new transceiver/m-line
+      peer.audioSender = peerConnection.addTrack(track, streamToUse);
+    } catch (error) {
+      console.error('Failed to attach local audio track:', error);
+    }
+  }
+
   private async createOffer(peerId: string) {
     console.log('Creating offer for peer:', peerId);
-    
+
     // Use "polite" peer pattern: the peer with smaller ID is polite
     const isPolite = this.myId < peerId;
     const peerConnection = this.createPeerConnection(peerId, isPolite);
     const peer = this.peers.get(peerId)!;
 
-    const streamToUse = this.processedStream || this.localStream;
-    if (streamToUse) {
-      const senders = peerConnection.getSenders();
-      const hasAudioSender = senders.some(s => s.track?.kind === 'audio');
-      if (!hasAudioSender) {
-        console.log('Adding local tracks to offer');
-        streamToUse.getTracks().forEach((track) => {
-          peerConnection.addTrack(track, streamToUse);
-        });
-      }
+    if (peer.makingOffer || peerConnection.signalingState !== 'stable') {
+      console.log('Skipping createOffer - negotiation in progress, state:', peerConnection.signalingState);
+      return;
     }
+
+    await this.attachLocalAudio(peerId, peerConnection);
 
     try {
       peer.makingOffer = true;
@@ -335,7 +354,7 @@ export class WebRTCManager {
       this.sendToSignalingServer({
         type: 'offer',
         to: peerId,
-        sdp: offer,
+        sdp: peerConnection.localDescription,
       });
     } catch (error) {
       console.error('Error creating offer:', error);
@@ -368,18 +387,7 @@ export class WebRTCManager {
       return;
     }
 
-    const streamToUse = this.processedStream || this.localStream;
-    if (streamToUse) {
-      const senders = peerConnection.getSenders();
-      const hasAudioSender = senders.some(s => s.track?.kind === 'audio');
-
-      if (!hasAudioSender) {
-        console.log('Adding local tracks to answer');
-        streamToUse.getTracks().forEach((track) => {
-          peerConnection.addTrack(track, streamToUse);
-        });
-      }
-    }
+    await this.attachLocalAudio(peerId, peerConnection);
 
     try {
       await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
@@ -464,6 +472,9 @@ export class WebRTCManager {
     console.log('Creating new peer connection for:', peerId, 'isPolite:', isPolite);
     const peerConnection = new RTCPeerConnection(ICE_SERVERS);
 
+    // Create a single, stable audio transceiver so later track changes don't create new m-lines
+    const audioTransceiver = peerConnection.addTransceiver('audio', { direction: 'sendrecv' });
+
     peerConnection.onicecandidate = (event) => {
       if (event.candidate) {
         this.sendToSignalingServer({
@@ -500,33 +511,15 @@ export class WebRTCManager {
       console.log(`Peer ${peerId} ICE state:`, peerConnection.iceConnectionState);
     };
 
-    // Handle negotiation needed for renegotiation
-    peerConnection.onnegotiationneeded = async () => {
-      const peer = this.peers.get(peerId);
-      if (!peer) return;
-      
-      try {
-        peer.makingOffer = true;
-        await peerConnection.setLocalDescription();
-        this.sendToSignalingServer({
-          type: 'offer',
-          to: peerId,
-          sdp: peerConnection.localDescription,
-        });
-      } catch (err) {
-        console.error('Error during negotiationneeded:', err);
-      } finally {
-        peer.makingOffer = false;
-      }
-    };
-
-    this.peers.set(peerId, { 
-      id: peerId, 
+    this.peers.set(peerId, {
+      id: peerId,
       connection: peerConnection,
+      audioSender: audioTransceiver.sender,
       isPolite,
       makingOffer: false,
       pendingCandidates: [],
     });
+
     return peerConnection;
   }
 
