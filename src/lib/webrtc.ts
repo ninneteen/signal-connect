@@ -2,6 +2,9 @@ export interface PeerConnection {
   id: string;
   connection: RTCPeerConnection;
   audioStream?: MediaStream;
+  isPolite: boolean; // For perfect negotiation pattern
+  makingOffer: boolean;
+  pendingCandidates: RTCIceCandidateInit[];
 }
 
 // Enhanced ICE configuration with TURN servers for cross-network connectivity
@@ -306,37 +309,63 @@ export class WebRTCManager {
 
   private async createOffer(peerId: string) {
     console.log('Creating offer for peer:', peerId);
-    const peerConnection = this.createPeerConnection(peerId);
+    
+    // Use "polite" peer pattern: the peer with smaller ID is polite
+    const isPolite = this.myId < peerId;
+    const peerConnection = this.createPeerConnection(peerId, isPolite);
+    const peer = this.peers.get(peerId)!;
 
     const streamToUse = this.processedStream || this.localStream;
     if (streamToUse) {
-      console.log('Adding local tracks to offer');
-      streamToUse.getTracks().forEach((track) => {
-        peerConnection.addTrack(track, streamToUse);
-      });
+      const senders = peerConnection.getSenders();
+      const hasAudioSender = senders.some(s => s.track?.kind === 'audio');
+      if (!hasAudioSender) {
+        console.log('Adding local tracks to offer');
+        streamToUse.getTracks().forEach((track) => {
+          peerConnection.addTrack(track, streamToUse);
+        });
+      }
     }
 
-    const offer = await peerConnection.createOffer();
-    await peerConnection.setLocalDescription(offer);
+    try {
+      peer.makingOffer = true;
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
 
-    this.sendToSignalingServer({
-      type: 'offer',
-      to: peerId,
-      sdp: offer,
-    });
+      this.sendToSignalingServer({
+        type: 'offer',
+        to: peerId,
+        sdp: offer,
+      });
+    } catch (error) {
+      console.error('Error creating offer:', error);
+    } finally {
+      peer.makingOffer = false;
+    }
   }
 
   private async handleOffer(peerId: string, sdp: RTCSessionDescriptionInit) {
     console.log('Handling offer from peer:', peerId);
 
-    // Check if peer already exists
+    // Use "polite" peer pattern: the peer with smaller ID is polite
+    const isPolite = this.myId < peerId;
     let peer = this.peers.get(peerId);
     let peerConnection: RTCPeerConnection;
 
     if (peer) {
       peerConnection = peer.connection;
     } else {
-      peerConnection = this.createPeerConnection(peerId);
+      peerConnection = this.createPeerConnection(peerId, isPolite);
+      peer = this.peers.get(peerId)!;
+    }
+
+    // Perfect negotiation pattern: handle collision
+    const offerCollision = peer.makingOffer || peerConnection.signalingState !== 'stable';
+    const ignoreOffer = !peer.isPolite && offerCollision;
+
+    if (ignoreOffer) {
+      console.log('Ignoring offer due to collision (we are impolite peer)');
+      return;
     }
 
     const streamToUse = this.processedStream || this.localStream;
@@ -352,36 +381,79 @@ export class WebRTCManager {
       }
     }
 
-    await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
-    const answer = await peerConnection.createAnswer();
-    await peerConnection.setLocalDescription(answer);
+    try {
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
+      
+      // Process any pending ICE candidates
+      if (peer.pendingCandidates.length > 0) {
+        console.log('Processing', peer.pendingCandidates.length, 'pending ICE candidates');
+        for (const candidate of peer.pendingCandidates) {
+          await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+        }
+        peer.pendingCandidates = [];
+      }
+      
+      const answer = await peerConnection.createAnswer();
+      await peerConnection.setLocalDescription(answer);
 
-    this.sendToSignalingServer({
-      type: 'answer',
-      to: peerId,
-      sdp: answer,
-    });
+      this.sendToSignalingServer({
+        type: 'answer',
+        to: peerId,
+        sdp: answer,
+      });
+    } catch (error) {
+      console.error('Error handling offer:', error);
+    }
   }
 
   private async handleAnswer(peerId: string, sdp: RTCSessionDescriptionInit) {
     const peer = this.peers.get(peerId);
-    if (peer) {
+    if (!peer) {
+      console.warn('No peer found for answer:', peerId);
+      return;
+    }
+
+    // Perfect negotiation: only accept answer if we're expecting one
+    if (peer.connection.signalingState !== 'have-local-offer') {
+      console.log('Ignoring answer - not in have-local-offer state, current state:', peer.connection.signalingState);
+      return;
+    }
+
+    try {
       await peer.connection.setRemoteDescription(new RTCSessionDescription(sdp));
+      
+      // Process any pending ICE candidates
+      if (peer.pendingCandidates.length > 0) {
+        console.log('Processing', peer.pendingCandidates.length, 'pending ICE candidates after answer');
+        for (const candidate of peer.pendingCandidates) {
+          await peer.connection.addIceCandidate(new RTCIceCandidate(candidate));
+        }
+        peer.pendingCandidates = [];
+      }
+    } catch (error) {
+      console.error('Error handling answer:', error);
     }
   }
 
   private async handleIceCandidate(peerId: string, candidate: RTCIceCandidateInit) {
     const peer = this.peers.get(peerId);
-    if (peer && candidate) {
-      try {
-        await peer.connection.addIceCandidate(new RTCIceCandidate(candidate));
-      } catch (error) {
-        console.error('Error adding ICE candidate:', error);
+    if (!peer || !candidate) return;
+
+    try {
+      // If remote description is not set yet, queue the candidate
+      if (!peer.connection.remoteDescription) {
+        console.log('Queueing ICE candidate for peer:', peerId);
+        peer.pendingCandidates.push(candidate);
+        return;
       }
+
+      await peer.connection.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (error) {
+      console.error('Error adding ICE candidate:', error);
     }
   }
 
-  private createPeerConnection(peerId: string): RTCPeerConnection {
+  private createPeerConnection(peerId: string, isPolite: boolean = false): RTCPeerConnection {
     // Check if connection already exists
     const existingPeer = this.peers.get(peerId);
     if (existingPeer) {
@@ -389,7 +461,7 @@ export class WebRTCManager {
       return existingPeer.connection;
     }
 
-    console.log('Creating new peer connection for:', peerId);
+    console.log('Creating new peer connection for:', peerId, 'isPolite:', isPolite);
     const peerConnection = new RTCPeerConnection(ICE_SERVERS);
 
     peerConnection.onicecandidate = (event) => {
@@ -428,7 +500,33 @@ export class WebRTCManager {
       console.log(`Peer ${peerId} ICE state:`, peerConnection.iceConnectionState);
     };
 
-    this.peers.set(peerId, { id: peerId, connection: peerConnection });
+    // Handle negotiation needed for renegotiation
+    peerConnection.onnegotiationneeded = async () => {
+      const peer = this.peers.get(peerId);
+      if (!peer) return;
+      
+      try {
+        peer.makingOffer = true;
+        await peerConnection.setLocalDescription();
+        this.sendToSignalingServer({
+          type: 'offer',
+          to: peerId,
+          sdp: peerConnection.localDescription,
+        });
+      } catch (err) {
+        console.error('Error during negotiationneeded:', err);
+      } finally {
+        peer.makingOffer = false;
+      }
+    };
+
+    this.peers.set(peerId, { 
+      id: peerId, 
+      connection: peerConnection,
+      isPolite,
+      makingOffer: false,
+      pendingCandidates: [],
+    });
     return peerConnection;
   }
 
